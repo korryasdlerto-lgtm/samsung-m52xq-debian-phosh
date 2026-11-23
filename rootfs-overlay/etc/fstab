@@ -1,0 +1,3 @@
+# M52XQ Debian test: the root is mounted by the initramfs (loop image /data/rootfs.img or the system partition).
+# No LABEL=pmOS_root line: the system partition of the phone has the same label.
+proc /proc proc defaults 0 0

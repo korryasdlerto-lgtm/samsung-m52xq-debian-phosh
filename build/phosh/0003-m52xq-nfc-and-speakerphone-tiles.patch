@@ -1,0 +1,687 @@
+From: Asdlerto Korry <korryasdlerto@gmail.com>
+Subject: [PATCH] plugins: m52xq NFC and speakerphone quick settings
+
+Samsung Galaxy M52 5G (m52xq), Debian Phosh в6:
+- m52xq-nfc-quick-setting: NFC on/off through /dev/rfkill (uaccess ACL of the active user), state from the
+  rfkill events (no polling);
+- m52xq-speakerphone-quick-setting: the "Speakerphone" app as a tile: runs /usr/local/bin/m52xq-speakerphone,
+  shows the route written by m52xq-audio-route to $XDG_RUNTIME_DIR/m52xq-audio-route, highlighted during a
+  Telegram call ($XDG_RUNTIME_DIR/m52xq-voip-active); inotify, no polling.
+---
+diff -ruN a/plugins/m52xq-nfc-quick-setting/icons/m52xq-nfc-disabled-symbolic.svg b/plugins/m52xq-nfc-quick-setting/icons/m52xq-nfc-disabled-symbolic.svg
+--- a/plugins/m52xq-nfc-quick-setting/icons/m52xq-nfc-disabled-symbolic.svg	1970-01-01 02:00:00.000000000 +0200
++++ b/plugins/m52xq-nfc-quick-setting/icons/m52xq-nfc-disabled-symbolic.svg	2026-11-20 22:10:18.566015431 +0200
+@@ -0,0 +1 @@
++<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><path fill="#2e3436" fill-opacity=".35" d="M3 1a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3a2 2 0 0 0-2-2zm0 2h4.5v5.6L11 5.2V3h2v10H8.5V7.4L5 10.8V13H3z"/><path fill="#2e3436" d="M1.7.3.3 1.7l14 14 1.4-1.4z"/></svg>
+diff -ruN a/plugins/m52xq-nfc-quick-setting/icons/m52xq-nfc-symbolic.svg b/plugins/m52xq-nfc-quick-setting/icons/m52xq-nfc-symbolic.svg
+--- a/plugins/m52xq-nfc-quick-setting/icons/m52xq-nfc-symbolic.svg	1970-01-01 02:00:00.000000000 +0200
++++ b/plugins/m52xq-nfc-quick-setting/icons/m52xq-nfc-symbolic.svg	2026-11-20 22:10:18.566015431 +0200
+@@ -0,0 +1 @@
++<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><path fill="#2e3436" d="M3 1a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3a2 2 0 0 0-2-2zm0 2h4.5v5.6L11 5.2V3h2v10H8.5V7.4L5 10.8V13H3z"/></svg>
+diff -ruN a/plugins/m52xq-nfc-quick-setting/m52xq-nfc-quick-setting.c b/plugins/m52xq-nfc-quick-setting/m52xq-nfc-quick-setting.c
+--- a/plugins/m52xq-nfc-quick-setting/m52xq-nfc-quick-setting.c	1970-01-01 02:00:00.000000000 +0200
++++ b/plugins/m52xq-nfc-quick-setting/m52xq-nfc-quick-setting.c	2026-11-20 22:10:18.574015209 +0200
+@@ -0,0 +1,195 @@
++/*
++ * Copyright (C) 2026 Asdlerto Korry
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++#include "m52xq-nfc-quick-setting.h"
++
++#include <glib-unix.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <string.h>
++#include <unistd.h>
++#include <linux/rfkill.h>
++
++/**
++ * PhoshM52xqNfcQuickSetting:
++ *
++ * Samsung Galaxy M52 5G (m52xq): turn NFC on and off through rfkill (/dev/rfkill, writable by the
++ * active local user through the uaccess ACL). The state comes from the rfkill events of /dev/rfkill:
++ * no polling, the phone is not woken up.
++ */
++
++struct _PhoshM52xqNfcQuickSetting {
++  PhoshQuickSetting  parent;
++
++  PhoshStatusIcon   *info;
++  int                fd;
++  guint              watch_id;
++  GHashTable        *blocked;   /* rfkill idx -> blocked (soft or hard) */
++};
++
++G_DEFINE_TYPE (PhoshM52xqNfcQuickSetting, phosh_m52xq_nfc_quick_setting, PHOSH_TYPE_QUICK_SETTING);
++
++
++static gboolean
++is_russian (void)
++{
++  const char * const *langs = g_get_language_names ();
++
++  return langs && langs[0] && g_str_has_prefix (langs[0], "ru");
++}
++
++
++static gboolean
++any_blocked (PhoshM52xqNfcQuickSetting *self)
++{
++  GHashTableIter iter;
++  gpointer value;
++
++  g_hash_table_iter_init (&iter, self->blocked);
++  while (g_hash_table_iter_next (&iter, NULL, &value)) {
++    if (GPOINTER_TO_INT (value))
++      return TRUE;
++  }
++  return FALSE;
++}
++
++
++static void
++update_ui (PhoshM52xqNfcQuickSetting *self)
++{
++  gboolean present = g_hash_table_size (self->blocked) > 0;
++  gboolean on = present && !any_blocked (self);
++  gboolean ru = is_russian ();
++  const char *info;
++
++  if (!present)
++    info = ru ? "NFC недоступен" : "NFC unavailable";
++  else if (on)
++    info = "NFC";
++  else
++    info = ru ? "NFC выключен" : "NFC off";
++
++  g_object_set (self->info,
++                "icon-name", on ? "m52xq-nfc-symbolic" : "m52xq-nfc-disabled-symbolic",
++                "info", info,
++                NULL);
++  g_object_set (self, "active", on, NULL);
++  gtk_widget_set_sensitive (GTK_WIDGET (self), present);
++}
++
++
++static gboolean
++on_rfkill_event (int fd, GIOCondition condition, gpointer user_data)
++{
++  PhoshM52xqNfcQuickSetting *self = PHOSH_M52XQ_NFC_QUICK_SETTING (user_data);
++  struct rfkill_event ev;
++
++  if (condition & (G_IO_HUP | G_IO_ERR | G_IO_NVAL)) {
++    self->watch_id = 0;
++    return G_SOURCE_REMOVE;
++  }
++
++  for (;;) {
++    ssize_t n;
++
++    memset (&ev, 0, sizeof (ev));
++    n = read (fd, &ev, sizeof (ev));
++    if (n < 0) {
++      if (errno == EINTR)
++        continue;
++      break;                      /* EAGAIN: all events read */
++    }
++    if (n < RFKILL_EVENT_SIZE_V1)
++      break;
++    if (ev.type != RFKILL_TYPE_NFC)
++      continue;
++
++    switch (ev.op) {
++    case RFKILL_OP_ADD:
++    case RFKILL_OP_CHANGE:
++      g_hash_table_insert (self->blocked, GUINT_TO_POINTER (ev.idx + 1),
++                           GINT_TO_POINTER (ev.soft || ev.hard));
++      break;
++    case RFKILL_OP_DEL:
++      g_hash_table_remove (self->blocked, GUINT_TO_POINTER (ev.idx + 1));
++      break;
++    default:
++      break;
++    }
++  }
++
++  update_ui (self);
++  return G_SOURCE_CONTINUE;
++}
++
++
++static void
++on_clicked (PhoshM52xqNfcQuickSetting *self)
++{
++  struct rfkill_event ev;
++
++  if (self->fd < 0 || g_hash_table_size (self->blocked) == 0)
++    return;
++
++  memset (&ev, 0, sizeof (ev));
++  ev.op = RFKILL_OP_CHANGE_ALL;
++  ev.type = RFKILL_TYPE_NFC;
++  ev.soft = any_blocked (self) ? 0 : 1;   /* blocked -> unblock, on -> block */
++
++  if (write (self->fd, &ev, RFKILL_EVENT_SIZE_V1) < 0)
++    g_warning ("rfkill NFC %s: %s", ev.soft ? "block" : "unblock", g_strerror (errno));
++  /* the new state arrives as an rfkill event */
++}
++
++
++static void
++phosh_m52xq_nfc_quick_setting_finalize (GObject *object)
++{
++  PhoshM52xqNfcQuickSetting *self = PHOSH_M52XQ_NFC_QUICK_SETTING (object);
++
++  g_clear_handle_id (&self->watch_id, g_source_remove);
++  if (self->fd >= 0)
++    close (self->fd);
++  self->fd = -1;
++  g_clear_pointer (&self->blocked, g_hash_table_destroy);
++
++  G_OBJECT_CLASS (phosh_m52xq_nfc_quick_setting_parent_class)->finalize (object);
++}
++
++
++static void
++phosh_m52xq_nfc_quick_setting_class_init (PhoshM52xqNfcQuickSettingClass *klass)
++{
++  GObjectClass *object_class = G_OBJECT_CLASS (klass);
++  GtkWidgetClass *widget_class = GTK_WIDGET_CLASS (klass);
++
++  object_class->finalize = phosh_m52xq_nfc_quick_setting_finalize;
++
++  gtk_widget_class_set_template_from_resource (widget_class,
++                                               "/mobi/phosh/plugins/m52xq-nfc-quick-setting/qs.ui");
++  gtk_widget_class_bind_template_child (widget_class, PhoshM52xqNfcQuickSetting, info);
++  gtk_widget_class_bind_template_callback (widget_class, on_clicked);
++}
++
++
++static void
++phosh_m52xq_nfc_quick_setting_init (PhoshM52xqNfcQuickSetting *self)
++{
++  gtk_widget_init_template (GTK_WIDGET (self));
++
++  gtk_icon_theme_add_resource_path (gtk_icon_theme_get_default (),
++                                    "/mobi/phosh/plugins/m52xq-nfc-quick-setting/icons");
++
++  self->blocked = g_hash_table_new (NULL, NULL);
++  self->fd = open ("/dev/rfkill", O_RDWR | O_NONBLOCK | O_CLOEXEC);
++  if (self->fd < 0)
++    g_warning ("/dev/rfkill: %s", g_strerror (errno));
++  else
++    self->watch_id = g_unix_fd_add (self->fd, G_IO_IN | G_IO_HUP | G_IO_ERR, on_rfkill_event, self);
++
++  /* /dev/rfkill sends an ADD event for every device right after the open */
++  update_ui (self);
++}
+diff -ruN a/plugins/m52xq-nfc-quick-setting/m52xq-nfc-quick-setting.desktop.in.in b/plugins/m52xq-nfc-quick-setting/m52xq-nfc-quick-setting.desktop.in.in
+--- a/plugins/m52xq-nfc-quick-setting/m52xq-nfc-quick-setting.desktop.in.in	1970-01-01 02:00:00.000000000 +0200
++++ b/plugins/m52xq-nfc-quick-setting/m52xq-nfc-quick-setting.desktop.in.in	2026-11-20 22:10:18.562015540 +0200
+@@ -0,0 +1,8 @@
++[Plugin]
++# Translators: This is an internal id, no need to translate it
++Id=@name@
++Name=NFC Quick Setting (M52XQ)
++Types=quick-setting;
++Comment=Turn NFC on and off (rfkill)
++Plugin=@plugins_dir@/libphosh-plugin-@name@.so
++Icon=m52xq-nfc-quick-setting
+diff -ruN a/plugins/m52xq-nfc-quick-setting/m52xq-nfc-quick-setting.h b/plugins/m52xq-nfc-quick-setting/m52xq-nfc-quick-setting.h
+--- a/plugins/m52xq-nfc-quick-setting/m52xq-nfc-quick-setting.h	1970-01-01 02:00:00.000000000 +0200
++++ b/plugins/m52xq-nfc-quick-setting/m52xq-nfc-quick-setting.h	2026-11-20 22:10:18.570015319 +0200
+@@ -0,0 +1,19 @@
++/*
++ * Copyright (C) 2026 Asdlerto Korry
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++#pragma once
++
++#include "quick-setting.h"
++
++G_BEGIN_DECLS
++
++#define PHOSH_TYPE_M52XQ_NFC_QUICK_SETTING phosh_m52xq_nfc_quick_setting_get_type ()
++
++G_DECLARE_FINAL_TYPE (PhoshM52xqNfcQuickSetting,
++                      phosh_m52xq_nfc_quick_setting,
++                      PHOSH, M52XQ_NFC_QUICK_SETTING, PhoshQuickSetting)
++
++G_END_DECLS
+diff -ruN a/plugins/m52xq-nfc-quick-setting/meson.build b/plugins/m52xq-nfc-quick-setting/meson.build
+--- a/plugins/m52xq-nfc-quick-setting/meson.build	1970-01-01 02:00:00.000000000 +0200
++++ b/plugins/m52xq-nfc-quick-setting/meson.build	2026-11-20 22:10:18.558015651 +0200
+@@ -0,0 +1,43 @@
++name = 'm52xq-nfc-quick-setting'
++
++m52xq_nfc_quick_setting_resources = gnome.compile_resources(
++  'phosh-plugin-m52xq-nfc-quick-setting-resources',
++  'phosh-plugin-m52xq-nfc-quick-setting.gresources.xml',
++  c_name: 'phosh_plugin_m52xq_nfc_quick_setting',
++)
++
++phosh_m52xq_nfc_quick_setting_plugin = shared_module(
++  'phosh-plugin-m52xq-nfc-quick-setting',
++  files('m52xq-nfc-quick-setting.c', 'phosh-plugin-m52xq-nfc-quick-setting.c'),
++  m52xq_nfc_quick_setting_resources,
++  c_args: [
++    '-DG_LOG_DOMAIN="phosh-plugin-@0@"'.format(name),
++    '-DPLUGIN_NAME="@0@"'.format(name),
++  ],
++  dependencies: [plugin_dep],
++  install: true,
++  install_dir: plugins_dir,
++)
++
++pluginconf = configuration_data()
++pluginconf.set('name', name)
++pluginconf.set('plugins_dir', plugins_dir)
++
++i18n.merge_file(
++  input: configure_file(
++    input: name + '.desktop.in.in',
++    output: name + '.desktop.in',
++    configuration: pluginconf,
++  ),
++  output: name + '.plugin',
++  po_dir: meson.project_source_root() / 'po',
++  install: true,
++  install_dir: plugins_dir,
++  type: 'desktop',
++)
++
++install_data(
++  'icons/m52xq-nfc-symbolic.svg',
++  rename: 'm52xq-nfc-quick-setting-symbolic.svg',
++  install_dir: phosh_plugin_icon_dir,
++)
+diff -ruN a/plugins/m52xq-nfc-quick-setting/phosh-plugin-m52xq-nfc-quick-setting.c b/plugins/m52xq-nfc-quick-setting/phosh-plugin-m52xq-nfc-quick-setting.c
+--- a/plugins/m52xq-nfc-quick-setting/phosh-plugin-m52xq-nfc-quick-setting.c	1970-01-01 02:00:00.000000000 +0200
++++ b/plugins/m52xq-nfc-quick-setting/phosh-plugin-m52xq-nfc-quick-setting.c	2026-11-20 22:10:18.570015319 +0200
+@@ -0,0 +1,38 @@
++/*
++ * Copyright (C) 2026 Asdlerto Korry
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++#include "m52xq-nfc-quick-setting.h"
++#include "phosh-plugin.h"
++
++
++char **g_io_phosh_plugin_m52xq_nfc_quick_setting_query (void);
++
++
++void
++g_io_module_load (GIOModule *module)
++{
++  g_type_module_use (G_TYPE_MODULE (module));
++
++  g_io_extension_point_implement (PHOSH_PLUGIN_EXTENSION_POINT_QUICK_SETTING_WIDGET,
++                                  PHOSH_TYPE_M52XQ_NFC_QUICK_SETTING,
++                                  PLUGIN_NAME,
++                                  10);
++}
++
++
++void
++g_io_module_unload (GIOModule *module)
++{
++}
++
++
++char **
++g_io_phosh_plugin_m52xq_nfc_quick_setting_query (void)
++{
++  char *extension_points[] = {PHOSH_PLUGIN_EXTENSION_POINT_QUICK_SETTING_WIDGET, NULL};
++
++  return g_strdupv (extension_points);
++}
+diff -ruN a/plugins/m52xq-nfc-quick-setting/phosh-plugin-m52xq-nfc-quick-setting.gresources.xml b/plugins/m52xq-nfc-quick-setting/phosh-plugin-m52xq-nfc-quick-setting.gresources.xml
+--- a/plugins/m52xq-nfc-quick-setting/phosh-plugin-m52xq-nfc-quick-setting.gresources.xml	1970-01-01 02:00:00.000000000 +0200
++++ b/plugins/m52xq-nfc-quick-setting/phosh-plugin-m52xq-nfc-quick-setting.gresources.xml	2026-11-20 22:10:18.562015540 +0200
+@@ -0,0 +1,8 @@
++<?xml version="1.0" encoding="utf-8"?>
++<gresources>
++  <gresource prefix="/mobi/phosh/plugins/m52xq-nfc-quick-setting/">
++    <file preprocess="xml-stripblanks">qs.ui</file>
++    <file compressed="true">icons/m52xq-nfc-symbolic.svg</file>
++    <file compressed="true">icons/m52xq-nfc-disabled-symbolic.svg</file>
++  </gresource>
++</gresources>
+diff -ruN a/plugins/m52xq-nfc-quick-setting/qs.ui b/plugins/m52xq-nfc-quick-setting/qs.ui
+--- a/plugins/m52xq-nfc-quick-setting/qs.ui	1970-01-01 02:00:00.000000000 +0200
++++ b/plugins/m52xq-nfc-quick-setting/qs.ui	2026-11-20 22:10:18.562015540 +0200
+@@ -0,0 +1,12 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<interface>
++  <requires lib="gtk+" version="3.24"/>
++  <template class="PhoshM52xqNfcQuickSetting" parent="PhoshQuickSetting">
++    <property name="status-icon">info</property>
++    <signal name="clicked" handler="on_clicked" object="PhoshM52xqNfcQuickSetting" swapped="yes"/>
++  </template>
++  <object class="PhoshStatusIcon" id="info">
++    <property name="visible">1</property>
++    <property name="pixel-size">16</property>
++  </object>
++</interface>
+diff -ruN a/plugins/m52xq-speakerphone-quick-setting/m52xq-speakerphone-quick-setting.c b/plugins/m52xq-speakerphone-quick-setting/m52xq-speakerphone-quick-setting.c
+--- a/plugins/m52xq-speakerphone-quick-setting/m52xq-speakerphone-quick-setting.c	1970-01-01 02:00:00.000000000 +0200
++++ b/plugins/m52xq-speakerphone-quick-setting/m52xq-speakerphone-quick-setting.c	2026-11-20 22:10:47.121253341 +0200
+@@ -0,0 +1,155 @@
++/*
++ * Copyright (C) 2026 Asdlerto Korry
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++#include "m52xq-speakerphone-quick-setting.h"
++
++/**
++ * PhoshM52xqSpeakerphoneQuickSetting:
++ *
++ * Samsung Galaxy M52 5G (m52xq): the "Speakerphone" app as a tile of the shade. A click runs
++ * /usr/local/bin/m52xq-speakerphone (during a Telegram call: earpiece -> loud speaker -> USB headset /
++ * Bluetooth headphones -> earpiece; outside a call it only shows a notification). The tile shows the
++ * route that m52xq-audio-route writes to $XDG_RUNTIME_DIR/m52xq-audio-route and is highlighted while a
++ * Telegram call is on ($XDG_RUNTIME_DIR/m52xq-voip-active of m52xq-voip-audio). Both files are watched
++ * with inotify (GFileMonitor): no polling.
++ */
++
++#define ROUTE_FILE  "m52xq-audio-route"
++#define CALL_FILE   "m52xq-voip-active"
++#define SPEAKERPHONE "/usr/local/bin/m52xq-speakerphone"
++
++struct _PhoshM52xqSpeakerphoneQuickSetting {
++  PhoshQuickSetting  parent;
++
++  PhoshStatusIcon   *info;
++  GFileMonitor      *monitor;
++  char              *route_path;
++  char              *call_path;
++};
++
++G_DEFINE_TYPE (PhoshM52xqSpeakerphoneQuickSetting, phosh_m52xq_speakerphone_quick_setting,
++               PHOSH_TYPE_QUICK_SETTING);
++
++
++static gboolean
++is_russian (void)
++{
++  const char * const *langs = g_get_language_names ();
++
++  return langs && langs[0] && g_str_has_prefix (langs[0], "ru");
++}
++
++
++static void
++update_ui (PhoshM52xqSpeakerphoneQuickSetting *self)
++{
++  g_autofree char *route = NULL;
++  gboolean ru = is_russian ();
++  gboolean in_call = g_file_test (self->call_path, G_FILE_TEST_EXISTS);
++  const char *info, *icon;
++
++  if (g_file_get_contents (self->route_path, &route, NULL, NULL))
++    g_strstrip (route);
++
++  if (g_strcmp0 (route, "earpiece") == 0) {
++    info = ru ? "Разговорный" : "Earpiece";
++    icon = "call-start-symbolic";
++  } else if (g_strcmp0 (route, "usb") == 0) {
++    info = ru ? "USB-гарнитура" : "USB headset";
++    icon = "audio-headset-symbolic";
++  } else if (g_strcmp0 (route, "bt") == 0) {
++    info = ru ? "Bluetooth" : "Bluetooth";
++    icon = "bluetooth-active-symbolic";
++  } else {
++    info = ru ? "Громкая связь" : "Speakerphone";
++    icon = "audio-speakers-symbolic";
++  }
++
++  g_object_set (self->info, "icon-name", icon, "info", info, NULL);
++  g_object_set (self, "active", in_call, NULL);
++}
++
++
++static void
++on_runtime_dir_changed (PhoshM52xqSpeakerphoneQuickSetting *self,
++                        GFile                              *file,
++                        GFile                              *other_file,
++                        GFileMonitorEvent                   event,
++                        GFileMonitor                       *monitor)
++{
++  g_autofree char *name = g_file_get_basename (file);
++  g_autofree char *other = other_file ? g_file_get_basename (other_file) : NULL;
++
++  /* m52xq-audio-route writes a temporary file and renames it over the route file */
++  if (g_strcmp0 (name, ROUTE_FILE) == 0 || g_strcmp0 (name, CALL_FILE) == 0 ||
++      g_strcmp0 (other, ROUTE_FILE) == 0)
++    update_ui (self);
++}
++
++
++static void
++on_clicked (PhoshM52xqSpeakerphoneQuickSetting *self)
++{
++  g_autoptr (GError) err = NULL;
++  const char *argv[] = { SPEAKERPHONE, NULL };
++
++  if (!g_spawn_async (NULL, (char **) argv, NULL, G_SPAWN_DEFAULT, NULL, NULL, NULL, &err))
++    g_warning ("%s: %s", SPEAKERPHONE, err->message);
++}
++
++
++static void
++phosh_m52xq_speakerphone_quick_setting_finalize (GObject *object)
++{
++  PhoshM52xqSpeakerphoneQuickSetting *self = PHOSH_M52XQ_SPEAKERPHONE_QUICK_SETTING (object);
++
++  if (self->monitor)
++    g_file_monitor_cancel (self->monitor);
++  g_clear_object (&self->monitor);
++  g_clear_pointer (&self->route_path, g_free);
++  g_clear_pointer (&self->call_path, g_free);
++
++  G_OBJECT_CLASS (phosh_m52xq_speakerphone_quick_setting_parent_class)->finalize (object);
++}
++
++
++static void
++phosh_m52xq_speakerphone_quick_setting_class_init (PhoshM52xqSpeakerphoneQuickSettingClass *klass)
++{
++  GObjectClass *object_class = G_OBJECT_CLASS (klass);
++  GtkWidgetClass *widget_class = GTK_WIDGET_CLASS (klass);
++
++  object_class->finalize = phosh_m52xq_speakerphone_quick_setting_finalize;
++
++  gtk_widget_class_set_template_from_resource (widget_class,
++                                               "/mobi/phosh/plugins/m52xq-speakerphone-quick-setting/qs.ui");
++  gtk_widget_class_bind_template_child (widget_class, PhoshM52xqSpeakerphoneQuickSetting, info);
++  gtk_widget_class_bind_template_callback (widget_class, on_clicked);
++}
++
++
++static void
++phosh_m52xq_speakerphone_quick_setting_init (PhoshM52xqSpeakerphoneQuickSetting *self)
++{
++  g_autoptr (GFile) dir = NULL;
++  g_autoptr (GError) err = NULL;
++  const char *rt = g_get_user_runtime_dir ();
++
++  gtk_widget_init_template (GTK_WIDGET (self));
++
++  self->route_path = g_build_filename (rt, ROUTE_FILE, NULL);
++  self->call_path = g_build_filename (rt, CALL_FILE, NULL);
++
++  dir = g_file_new_for_path (rt);
++  self->monitor = g_file_monitor_directory (dir, G_FILE_MONITOR_WATCH_MOVES, NULL, &err);
++  if (self->monitor)
++    g_signal_connect_object (self->monitor, "changed", G_CALLBACK (on_runtime_dir_changed), self,
++                             G_CONNECT_SWAPPED);
++  else
++    g_warning ("monitor %s: %s", rt, err->message);
++
++  update_ui (self);
++}
+diff -ruN a/plugins/m52xq-speakerphone-quick-setting/m52xq-speakerphone-quick-setting.desktop.in.in b/plugins/m52xq-speakerphone-quick-setting/m52xq-speakerphone-quick-setting.desktop.in.in
+--- a/plugins/m52xq-speakerphone-quick-setting/m52xq-speakerphone-quick-setting.desktop.in.in	1970-01-01 02:00:00.000000000 +0200
++++ b/plugins/m52xq-speakerphone-quick-setting/m52xq-speakerphone-quick-setting.desktop.in.in	2026-11-20 22:10:47.113253547 +0200
+@@ -0,0 +1,8 @@
++[Plugin]
++# Translators: This is an internal id, no need to translate it
++Id=@name@
++Name=Speakerphone Quick Setting (M52XQ)
++Types=quick-setting;
++Comment=Switch the sound of a Telegram call: loud speaker, earpiece, headsets
++Plugin=@plugins_dir@/libphosh-plugin-@name@.so
++Icon=audio-speakers-symbolic
+diff -ruN a/plugins/m52xq-speakerphone-quick-setting/m52xq-speakerphone-quick-setting.h b/plugins/m52xq-speakerphone-quick-setting/m52xq-speakerphone-quick-setting.h
+--- a/plugins/m52xq-speakerphone-quick-setting/m52xq-speakerphone-quick-setting.h	1970-01-01 02:00:00.000000000 +0200
++++ b/plugins/m52xq-speakerphone-quick-setting/m52xq-speakerphone-quick-setting.h	2026-11-20 22:10:47.117253443 +0200
+@@ -0,0 +1,19 @@
++/*
++ * Copyright (C) 2026 Asdlerto Korry
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++#pragma once
++
++#include "quick-setting.h"
++
++G_BEGIN_DECLS
++
++#define PHOSH_TYPE_M52XQ_SPEAKERPHONE_QUICK_SETTING phosh_m52xq_speakerphone_quick_setting_get_type ()
++
++G_DECLARE_FINAL_TYPE (PhoshM52xqSpeakerphoneQuickSetting,
++                      phosh_m52xq_speakerphone_quick_setting,
++                      PHOSH, M52XQ_SPEAKERPHONE_QUICK_SETTING, PhoshQuickSetting)
++
++G_END_DECLS
+diff -ruN a/plugins/m52xq-speakerphone-quick-setting/meson.build b/plugins/m52xq-speakerphone-quick-setting/meson.build
+--- a/plugins/m52xq-speakerphone-quick-setting/meson.build	1970-01-01 02:00:00.000000000 +0200
++++ b/plugins/m52xq-speakerphone-quick-setting/meson.build	2026-11-20 22:10:47.109253651 +0200
+@@ -0,0 +1,38 @@
++name = 'm52xq-speakerphone-quick-setting'
++
++m52xq_speakerphone_quick_setting_resources = gnome.compile_resources(
++  'phosh-plugin-m52xq-speakerphone-quick-setting-resources',
++  'phosh-plugin-m52xq-speakerphone-quick-setting.gresources.xml',
++  c_name: 'phosh_plugin_m52xq_speakerphone_quick_setting',
++)
++
++phosh_m52xq_speakerphone_quick_setting_plugin = shared_module(
++  'phosh-plugin-m52xq-speakerphone-quick-setting',
++  files('m52xq-speakerphone-quick-setting.c', 'phosh-plugin-m52xq-speakerphone-quick-setting.c'),
++  m52xq_speakerphone_quick_setting_resources,
++  c_args: [
++    '-DG_LOG_DOMAIN="phosh-plugin-@0@"'.format(name),
++    '-DPLUGIN_NAME="@0@"'.format(name),
++  ],
++  dependencies: [plugin_dep],
++  install: true,
++  install_dir: plugins_dir,
++)
++
++pluginconf = configuration_data()
++pluginconf.set('name', name)
++pluginconf.set('plugins_dir', plugins_dir)
++
++i18n.merge_file(
++  input: configure_file(
++    input: name + '.desktop.in.in',
++    output: name + '.desktop.in',
++    configuration: pluginconf,
++  ),
++  output: name + '.plugin',
++  po_dir: meson.project_source_root() / 'po',
++  install: true,
++  install_dir: plugins_dir,
++  type: 'desktop',
++)
++
+diff -ruN a/plugins/m52xq-speakerphone-quick-setting/phosh-plugin-m52xq-speakerphone-quick-setting.c b/plugins/m52xq-speakerphone-quick-setting/phosh-plugin-m52xq-speakerphone-quick-setting.c
+--- a/plugins/m52xq-speakerphone-quick-setting/phosh-plugin-m52xq-speakerphone-quick-setting.c	1970-01-01 02:00:00.000000000 +0200
++++ b/plugins/m52xq-speakerphone-quick-setting/phosh-plugin-m52xq-speakerphone-quick-setting.c	2026-11-20 22:10:47.121253341 +0200
+@@ -0,0 +1,38 @@
++/*
++ * Copyright (C) 2026 Asdlerto Korry
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++#include "m52xq-speakerphone-quick-setting.h"
++#include "phosh-plugin.h"
++
++
++char **g_io_phosh_plugin_m52xq_speakerphone_quick_setting_query (void);
++
++
++void
++g_io_module_load (GIOModule *module)
++{
++  g_type_module_use (G_TYPE_MODULE (module));
++
++  g_io_extension_point_implement (PHOSH_PLUGIN_EXTENSION_POINT_QUICK_SETTING_WIDGET,
++                                  PHOSH_TYPE_M52XQ_SPEAKERPHONE_QUICK_SETTING,
++                                  PLUGIN_NAME,
++                                  10);
++}
++
++
++void
++g_io_module_unload (GIOModule *module)
++{
++}
++
++
++char **
++g_io_phosh_plugin_m52xq_speakerphone_quick_setting_query (void)
++{
++  char *extension_points[] = {PHOSH_PLUGIN_EXTENSION_POINT_QUICK_SETTING_WIDGET, NULL};
++
++  return g_strdupv (extension_points);
++}
+diff -ruN a/plugins/m52xq-speakerphone-quick-setting/phosh-plugin-m52xq-speakerphone-quick-setting.gresources.xml b/plugins/m52xq-speakerphone-quick-setting/phosh-plugin-m52xq-speakerphone-quick-setting.gresources.xml
+--- a/plugins/m52xq-speakerphone-quick-setting/phosh-plugin-m52xq-speakerphone-quick-setting.gresources.xml	1970-01-01 02:00:00.000000000 +0200
++++ b/plugins/m52xq-speakerphone-quick-setting/phosh-plugin-m52xq-speakerphone-quick-setting.gresources.xml	2026-11-20 22:10:47.117253443 +0200
+@@ -0,0 +1,6 @@
++<?xml version="1.0" encoding="utf-8"?>
++<gresources>
++  <gresource prefix="/mobi/phosh/plugins/m52xq-speakerphone-quick-setting/">
++    <file preprocess="xml-stripblanks">qs.ui</file>
++  </gresource>
++</gresources>
+diff -ruN a/plugins/m52xq-speakerphone-quick-setting/qs.ui b/plugins/m52xq-speakerphone-quick-setting/qs.ui
+--- a/plugins/m52xq-speakerphone-quick-setting/qs.ui	1970-01-01 02:00:00.000000000 +0200
++++ b/plugins/m52xq-speakerphone-quick-setting/qs.ui	2026-11-20 22:10:47.117253443 +0200
+@@ -0,0 +1,12 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<interface>
++  <requires lib="gtk+" version="3.24"/>
++  <template class="PhoshM52xqSpeakerphoneQuickSetting" parent="PhoshQuickSetting">
++    <property name="status-icon">info</property>
++    <signal name="clicked" handler="on_clicked" object="PhoshM52xqSpeakerphoneQuickSetting" swapped="yes"/>
++  </template>
++  <object class="PhoshStatusIcon" id="info">
++    <property name="visible">1</property>
++    <property name="pixel-size">16</property>
++  </object>
++</interface>
+diff -ruN a/plugins/meson.build b/plugins/meson.build
+--- a/plugins/meson.build	2026-11-20 22:10:58.132972062 +0200
++++ b/plugins/meson.build	2026-11-20 22:10:58.156971458 +0200
+@@ -71,6 +71,8 @@
+   'caffeine-quick-setting',
+   'dark-mode-quick-setting',
+   'location-quick-setting',
++  'm52xq-nfc-quick-setting',
++  'm52xq-speakerphone-quick-setting',
+   'mobile-data-quick-setting',
+   'night-light-quick-setting',
+   'pomodoro-quick-setting',

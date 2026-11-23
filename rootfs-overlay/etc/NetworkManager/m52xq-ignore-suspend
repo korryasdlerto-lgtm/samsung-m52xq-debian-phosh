@@ -1,0 +1,1 @@
+# m52xq: NetworkManager ignores the logind sleep/resume signal (see m52xq-ignore-suspend.patch); remove to restore the usual behaviour

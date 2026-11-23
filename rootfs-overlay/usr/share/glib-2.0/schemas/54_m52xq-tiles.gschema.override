@@ -1,0 +1,4 @@
+# M52XQ (Debian Phosh в6, 2026-11-20): our tiles in the shade by default — speakerphone (Telegram calls; replaces the
+# "Speakerphone" app) and NFC (rfkill). Users who already changed the list in Mobile Settings keep their own list.
+[sm.puri.phosh.plugins]
+quick-settings=['m52xq-speakerphone-quick-setting', 'm52xq-nfc-quick-setting', 'wifi-hotspot-quick-setting', 'mobile-data-quick-setting', 'caffeine-quick-setting', 'dark-mode-quick-setting', 'night-light-quick-setting', 'location-quick-setting']

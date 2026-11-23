@@ -1,0 +1,3 @@
+libphosh-plugin-calendar.so: phosh-lockscreen-widget
+libphosh-plugin-emergency-info.so: phosh-lockscreen-widget
+libphosh-plugin-ticket-box.so: phosh-lockscreen-widget

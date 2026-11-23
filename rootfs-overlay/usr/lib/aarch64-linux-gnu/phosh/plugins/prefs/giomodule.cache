@@ -1,0 +1,5 @@
+libphosh-plugin-prefs-caffeine-quick-setting.so: phosh-quick-setting-widget-prefs
+libphosh-plugin-prefs-emergency-info.so: phosh-lockscreen-widget-prefs
+libphosh-plugin-prefs-pomodoro-quick-setting.so: phosh-quick-setting-widget-prefs
+libphosh-plugin-prefs-ticket-box.so: phosh-lockscreen-widget-prefs
+libphosh-plugin-prefs-upcoming-events.so: phosh-lockscreen-widget-prefs

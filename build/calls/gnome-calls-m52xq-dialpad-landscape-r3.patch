@@ -1,0 +1,186 @@
+--- a/subprojects/libcall-ui/src/cui-dialpad.c	2026-11-19 01:43:47.823351432 +0200
++++ b/subprojects/libcall-ui/src/cui-dialpad.c	2026-11-19 03:00:04.548794243 +0200
+@@ -56,6 +56,8 @@
+   /* m52xq: landscape layout (number and call button on the left, digits on the right) */
+   gboolean             landscape;
+   guint                layout_idle_id;
++  GdkMonitor          *m52xq_monitor;          /* r3: the screen whose size decides the layout */
++  gulong               m52xq_geometry_handler;
+ };
+ 
+ G_DEFINE_TYPE (CuiDialpad, cui_dialpad, ADW_TYPE_BIN);
+@@ -129,8 +131,11 @@
+ 
+ /* m52xq: in a landscape window the portrait column (number, 4 rows of keys, call button) does not fit the height
+  * of a phone screen and had to be scrolled. There the number and the call/backspace buttons go to a left column
+- * and the keys to the right; the portrait layout is unchanged. Decided on the window size, as the dialpad itself
+- * lives in a scrolled window and always gets its natural height. */
++ * and the keys to the right; the portrait layout is unchanged.
++ * r3 (Debian 2026-11-19): the window size did not work (the landscape layout never came: GTK keeps the window at least as
++ * big as its content, as in the call display before its r106): now the MONITOR geometry decides (logical size, changes
++ * on rotation), as in cui-call-display.c; after a change the window is laid out again. In landscape the keys are
++ * smaller (CSS class m52xq-landscape) so that 4 rows, the SIM selector and the header fit ~360 px of height. */
+ static void
+ apply_layout (CuiDialpad *self)
+ {
+@@ -159,6 +164,7 @@
+     gtk_widget_set_margin_top (GTK_WIDGET (self->grid), 4);
+     gtk_widget_set_margin_bottom (GTK_WIDGET (self->grid), 4);
+     adw_clamp_set_maximum_size (self->clamp, 640);
++    gtk_widget_add_css_class (GTK_WIDGET (self), "m52xq-landscape");
+   } else {
+     gtk_grid_attach (self->grid, entry, 0, 0, 1, 1);
+     gtk_grid_attach (self->grid, keypad, 0, 1, 1, 1);
+@@ -173,11 +179,21 @@
+     gtk_widget_set_margin_top (GTK_WIDGET (self->grid), 16);
+     gtk_widget_set_margin_bottom (GTK_WIDGET (self->grid), 16);
+     adw_clamp_set_maximum_size (self->clamp, 300);
++    gtk_widget_remove_css_class (GTK_WIDGET (self), "m52xq-landscape");
+   }
+ 
+   g_object_unref (entry);
+   g_object_unref (keypad);
+   g_object_unref (control);
++
++  /* r3: let the window fit the screen again (the previous layout may have made it bigger) */
++  {
++    GtkRoot *root = gtk_widget_get_root (GTK_WIDGET (self));
++
++    if (root)
++      gtk_widget_queue_resize (GTK_WIDGET (root));
++  }
++  g_debug ("m52xq: dialpad %s layout", self->landscape ? "landscape" : "portrait");
+ }
+ 
+ 
+@@ -193,27 +209,64 @@
+ 
+ 
+ static void
+-cui_dialpad_size_allocate (GtkWidget *widget,
+-                           int        width,
+-                           int        height,
+-                           int        baseline)
+-{
+-  CuiDialpad *self = CUI_DIALPAD (widget);
+-  GtkRoot *root = gtk_widget_get_root (widget);
+-
+-  GTK_WIDGET_CLASS (cui_dialpad_parent_class)->size_allocate (widget, width, height, baseline);
+-
+-  if (root) {
+-    int w = gtk_widget_get_width (GTK_WIDGET (root));
+-    int h = gtk_widget_get_height (GTK_WIDGET (root));
+-    gboolean landscape = w > h && h > 0 && h < 600;
+-
+-    if (landscape != self->landscape) {
+-      self->landscape = landscape;
+-      if (!self->layout_idle_id)
+-        self->layout_idle_id = g_idle_add (layout_idle_cb, self);
++m52xq_decide (CuiDialpad *self)
++{
++  GdkRectangle geo;
++  gboolean landscape;
++
++  if (!self->m52xq_monitor)
++    return;
++  gdk_monitor_get_geometry (self->m52xq_monitor, &geo);
++  landscape = geo.width > geo.height && geo.height < 600;
++  if (landscape == self->landscape)
++    return;
++  g_debug ("m52xq: dialpad, screen %dx%d -> %s", geo.width, geo.height, landscape ? "landscape" : "portrait");
++  self->landscape = landscape;
++  if (!self->layout_idle_id)
++    self->layout_idle_id = g_idle_add (layout_idle_cb, self);
++}
++
++
++static void
++m52xq_on_geometry (GdkMonitor *monitor, GParamSpec *pspec, CuiDialpad *self)
++{
++  m52xq_decide (self);
++}
++
++
++static void
++m52xq_on_unrealize (GtkWidget *widget, CuiDialpad *self)
++{
++  if (self->m52xq_monitor) {
++    g_clear_signal_handler (&self->m52xq_geometry_handler, self->m52xq_monitor);
++    g_clear_object (&self->m52xq_monitor);
++  }
++}
++
++
++static void
++m52xq_on_realize (GtkWidget *widget, CuiDialpad *self)
++{
++  GtkNative *native = gtk_widget_get_native (widget);
++  GdkSurface *surface = native ? gtk_native_get_surface (native) : NULL;
++  GdkMonitor *monitor = NULL;
++
++  if (surface)
++    monitor = gdk_display_get_monitor_at_surface (gdk_surface_get_display (surface), surface);
++  if (!monitor) {
++    GListModel *list = gdk_display_get_monitors (gtk_widget_get_display (widget));
++
++    if (g_list_model_get_n_items (list) > 0) {
++      monitor = g_list_model_get_item (list, 0);
++      g_object_unref (monitor);  /* the list keeps it */
+     }
+   }
++  if (!monitor || monitor == self->m52xq_monitor)
++    return;
++  m52xq_on_unrealize (widget, self);
++  self->m52xq_monitor = g_object_ref (monitor);
++  self->m52xq_geometry_handler = g_signal_connect (monitor, "notify::geometry", G_CALLBACK (m52xq_on_geometry), self);
++  m52xq_decide (self);
+ }
+ 
+ 
+@@ -223,6 +276,7 @@
+   CuiDialpad *self = CUI_DIALPAD (object);
+ 
+   g_clear_handle_id (&self->layout_idle_id, g_source_remove);
++  m52xq_on_unrealize (NULL, self);
+ 
+   GtkWidget *clamp = GTK_WIDGET (self->clamp);
+   g_clear_pointer (&clamp, gtk_widget_unparent);
+@@ -241,7 +295,6 @@
+   object_class->set_property = cui_dialpad_set_property;
+ 
+   object_class->dispose = cui_dialpad_dispose;
+-  widget_class->size_allocate = cui_dialpad_size_allocate;
+ 
+   signals[DIALED] =
+     g_signal_new ("dialed",
+@@ -292,6 +345,9 @@
+ 
+   gtk_widget_init_template (GTK_WIDGET (self));
+ 
++  g_signal_connect (self, "realize", G_CALLBACK (m52xq_on_realize), self);
++  g_signal_connect (self, "unrealize", G_CALLBACK (m52xq_on_unrealize), self);
++
+   gtk_widget_add_controller (GTK_WIDGET (self->backspace), GTK_EVENT_CONTROLLER (gesture));
+ }
+ 
+--- a/subprojects/libcall-ui/src/style.css	2026-11-19 01:43:47.631350969 +0200
++++ b/subprojects/libcall-ui/src/style.css	2026-11-19 03:00:04.552794149 +0200
+@@ -35,3 +35,18 @@
+ #cui_call_buttons {
+   font-size: 10pt;
+ }
++
++/* m52xq r3: landscape dial pad (class set by CuiDialpad when the screen is wide and low): smaller keys so that
++ * 4 rows, the SIM selector and the header bar fit ~360 px of height */
++cui-dialpad.m52xq-landscape cui-keypad > grid > button {
++  padding: 0px 14px;
++  min-height: 40px;
++}
++
++cui-dialpad.m52xq-landscape cui-keypad .digit { font-size: 150%; }
++
++cui-dialpad.m52xq-landscape cui-keypad .letters { font-size: 60%; }
++
++cui-dialpad.m52xq-landscape .dial-button {
++  padding: 12px 36px;
++}
